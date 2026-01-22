@@ -1,0 +1,23 @@
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pac-push-pipeline
+  annotations:
+    # Trigger on push events to main branch
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    # Keep only last 2 pipeline runs
+    pipelinesascode.tekton.dev/max-keep-runs: "2"
+spec:
+  pipelineSpec:
+    tasks:
+      - name: build-notification
+        taskSpec:
+          steps:
+            - name: notify
+              image: registry.access.redhat.com/ubi9/ubi-micro
+              command:
+                - /bin/echo
+              args:
+                - "Push to main detected! Running CI pipeline..."
