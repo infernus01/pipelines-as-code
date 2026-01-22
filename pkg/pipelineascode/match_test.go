@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v71/github"
+	"github.com/google/go-github/v81/github"
 	apipac "github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/keys"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/consoleui"
@@ -58,6 +58,13 @@ func TestPacRun_checkNeedUpdate(t *testing.T) {
 }
 
 func TestChangePipelineRun(t *testing.T) {
+	repo := &v1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testrepo",
+			Namespace: "test",
+		},
+	}
+
 	prs := []*tektonv1.PipelineRun{
 		{
 			ObjectMeta: metav1.ObjectMeta{
@@ -66,21 +73,59 @@ func TestChangePipelineRun(t *testing.T) {
 			},
 		},
 	}
-	event := info.NewEvent()
-	event.Repository = "testrepo"
-	p := &PacRun{event: event}
-	repo := &v1alpha1.Repository{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "testrepo",
-			Namespace: "test",
+
+	jsonErrorPRs := []*tektonv1.PipelineRun{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "json-error-pr",
+				Namespace: "test",
+			},
+			Spec: tektonv1.PipelineRunSpec{
+				Params: []tektonv1.Param{
+					{
+						Name: "my-param",
+						Value: tektonv1.ParamValue{
+							// We are intentionally leaving this empty:
+							// Type: tektonv1.ParamTypeString,
+							StringVal: "some-value",
+						},
+					},
+				},
+			},
 		},
 	}
-	ctx, _ := rtesting.SetupFakeContext(t)
-	err := p.changePipelineRun(ctx, repo, prs)
-	assert.NilError(t, err)
-	assert.Assert(t, strings.HasPrefix(prs[0].GetName(), "pac-gitauth"), prs[0].GetName(), "has no pac-gitauth prefix")
-	assert.Assert(t, prs[0].GetAnnotations()[apipac.GitAuthSecret] != "")
-	assert.Assert(t, prs[0].GetNamespace() == "testrepo", "namespace should be testrepo: %v", prs[0].GetNamespace())
+
+	tests := []struct {
+		name          string
+		prs           []*tektonv1.PipelineRun
+		expectedError string
+	}{
+		{
+			name: "test with params",
+			prs:  prs,
+		},
+		{
+			name:          "test with json error",
+			prs:           jsonErrorPRs,
+			expectedError: "failed to marshal PipelineRun json-error-pr: json: error calling MarshalJSON for type v1.ParamValue: impossible ParamValues.Type: \"\"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := info.NewEvent()
+			event.Repository = "testrepo"
+			p := &PacRun{event: event}
+			ctx, _ := rtesting.SetupFakeContext(t)
+			err := p.changePipelineRun(ctx, repo, tt.prs)
+			if tt.expectedError != "" {
+				assert.Error(t, err, tt.expectedError)
+				return
+			}
+			assert.Assert(t, strings.HasPrefix(tt.prs[0].GetName(), "pac-gitauth"), tt.prs[0].GetName(), "has no pac-gitauth prefix")
+			assert.Assert(t, tt.prs[0].GetAnnotations()[apipac.GitAuthSecret] != "")
+			assert.Assert(t, tt.prs[0].GetNamespace() == "testrepo", "namespace should be testrepo: %v", tt.prs[0].GetNamespace())
+		})
+	}
 }
 
 func TestFilterRunningPipelineRunOnTargetTest(t *testing.T) {
@@ -290,9 +335,9 @@ func TestGetPipelineRunsFromRepo(t *testing.T) {
 			p.eventEmitter = events.NewEventEmitter(stdata.Kube, logger)
 			matchedPRs, err := p.getPipelineRunsFromRepo(ctx, tt.repositories)
 			assert.NilError(t, err)
-			matchedPRNames := []string{}
+			matchedPRNames := make([]string, len(matchedPRs))
 			for i := range matchedPRs {
-				matchedPRNames = append(matchedPRNames, matchedPRs[i].PipelineRun.GetGenerateName())
+				matchedPRNames[i] = matchedPRs[i].PipelineRun.GetGenerateName()
 			}
 			if tt.logSnippet != "" {
 				assert.Assert(t, logCatcher.FilterMessageSnippet(tt.logSnippet).Len() > 0, logCatcher.All())
@@ -442,28 +487,6 @@ func TestVerifyRepoAndUser(t *testing.T) {
 			wantRepoNil:   true,
 			wantErr:       true,
 			wantErrMsg:    "failed to run create status, user is not allowed to run the CI",
-		},
-		{
-			name: "commit not found",
-			runevent: info.Event{
-				Organization:   "owner",
-				Repository:     "repo",
-				URL:            "https://example.com/owner/repo",
-				SHA:            "",
-				EventType:      triggertype.PullRequest.String(),
-				TriggerTarget:  triggertype.PullRequest,
-				InstallationID: 1,
-				Sender:         "owner",
-				Request:        request,
-			},
-			repositories: []*v1alpha1.Repository{{
-				ObjectMeta: metav1.ObjectMeta{Name: "repo", Namespace: "ns"},
-				Spec:       v1alpha1.RepositorySpec{URL: "https://example.com/owner/repo"},
-			}},
-			webhookSecret: "secret",
-			wantRepoNil:   false,
-			wantErr:       true,
-			wantErrMsg:    "could not find commit info",
 		},
 		{
 			name: "happy path",

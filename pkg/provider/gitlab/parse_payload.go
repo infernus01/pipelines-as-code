@@ -54,7 +54,7 @@ func (v *Provider) ParsePayload(ctx context.Context, run *params.Run, request *h
 		processedEvent.BaseBranch = gitEvent.ObjectAttributes.TargetBranch
 		processedEvent.HeadURL = gitEvent.ObjectAttributes.Source.WebURL
 		processedEvent.BaseURL = gitEvent.ObjectAttributes.Target.WebURL
-		processedEvent.PullRequestNumber = gitEvent.ObjectAttributes.IID
+		processedEvent.PullRequestNumber = int(gitEvent.ObjectAttributes.IID)
 		processedEvent.PullRequestTitle = gitEvent.ObjectAttributes.Title
 		v.targetProjectID = gitEvent.Project.ID
 		v.sourceProjectID = gitEvent.ObjectAttributes.SourceProjectID
@@ -153,7 +153,7 @@ func (v *Provider) ParsePayload(ctx context.Context, run *params.Run, request *h
 		processedEvent.Organization, processedEvent.Repository = getOrgRepo(v.pathWithNamespace)
 		processedEvent.TriggerTarget = triggertype.PullRequest
 
-		processedEvent.PullRequestNumber = gitEvent.MergeRequest.IID
+		processedEvent.PullRequestNumber = int(gitEvent.MergeRequest.IID)
 		v.targetProjectID = gitEvent.MergeRequest.TargetProjectID
 		v.sourceProjectID = gitEvent.MergeRequest.SourceProjectID
 		v.userID = gitEvent.User.ID
@@ -256,12 +256,20 @@ func (v *Provider) handleCommitCommentEvent(ctx context.Context, event *gitlab.C
 	var (
 		branchName string
 		prName     string
+		tagName    string
 		err        error
 	)
 
+	// since we're going to make an API call to ensure that the commit is HEAD of the branch
+	// therefore we need to initialize GitLab client here
+	processedEvent, err = v.initGitLabClient(ctx, processedEvent)
+	if err != nil {
+		return processedEvent, err
+	}
+
 	// get PipelineRun name from comment if it does contain e.g. `/test pr7`
 	if provider.IsTestRetestComment(event.ObjectAttributes.Note) {
-		prName, branchName, err = opscomments.GetPipelineRunAndBranchNameFromTestComment(event.ObjectAttributes.Note)
+		prName, branchName, tagName, err = provider.GetPipelineRunAndBranchOrTagNameFromTestComment(event.ObjectAttributes.Note)
 		if err != nil {
 			return processedEvent, err
 		}
@@ -270,7 +278,7 @@ func (v *Provider) handleCommitCommentEvent(ctx context.Context, event *gitlab.C
 
 	if provider.IsCancelComment(event.ObjectAttributes.Note) {
 		action = "cancellation"
-		prName, branchName, err = opscomments.GetPipelineRunAndBranchNameFromCancelComment(event.ObjectAttributes.Note)
+		prName, branchName, tagName, err = provider.GetPipelineRunAndBranchOrTagNameFromCancelComment(event.ObjectAttributes.Note)
 		if err != nil {
 			return processedEvent, err
 		}
@@ -278,15 +286,24 @@ func (v *Provider) handleCommitCommentEvent(ctx context.Context, event *gitlab.C
 		processedEvent.TargetCancelPipelineRun = prName
 	}
 
-	if branchName == "" {
-		branchName = processedEvent.HeadBranch
+	if tagName != "" {
+		tagPath := fmt.Sprintf("refs/tags/%s", tagName)
+		tag, _, err := v.gitlabClient.Tags.GetTag(v.sourceProjectID, tagName)
+		if err != nil {
+			return processedEvent, fmt.Errorf("error getting tag %s: %w", tagName, err)
+		}
+
+		if tag.Commit.ID != processedEvent.SHA {
+			return processedEvent, fmt.Errorf("provided SHA %s is not the tagged commit for the tag %s", processedEvent.SHA, tagName)
+		}
+
+		processedEvent.HeadBranch = tagPath
+		processedEvent.BaseBranch = tagPath
+		return processedEvent, nil
 	}
 
-	// since we're going to make an API call to ensure that the commit is HEAD of the branch
-	// therefore we need to initialize GitLab client here
-	processedEvent, err = v.initGitLabClient(ctx, processedEvent)
-	if err != nil {
-		return processedEvent, err
+	if branchName == "" {
+		branchName = processedEvent.HeadBranch
 	}
 
 	// check if the commit on which comment is made, is HEAD commit of the branch

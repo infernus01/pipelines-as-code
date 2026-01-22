@@ -11,7 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/go-github/v71/github"
+	"github.com/gobwas/glob"
+	"github.com/google/go-github/v81/github"
 	"github.com/jonboulle/clockwork"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/keys"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
@@ -55,7 +56,8 @@ type Provider struct {
 	PaginedNumber int
 	userType      string // The type of user i.e bot or not
 	skippedRun
-	triggerEvent string
+	triggerEvent       string
+	cachedChangedFiles *changedfiles.ChangedFiles
 }
 
 type skippedRun struct {
@@ -406,6 +408,24 @@ func (v *Provider) GetCommitInfo(ctx context.Context, runevent *info.Event) erro
 	runevent.SHAURL = commit.GetHTMLURL()
 	runevent.SHATitle = strings.Split(commit.GetMessage(), "\n\n")[0]
 	runevent.SHA = commit.GetSHA()
+	runevent.HasSkipCommand = provider.SkipCI(commit.GetMessage())
+
+	// Populate full commit information for LLM context
+	runevent.SHAMessage = commit.GetMessage()
+	if commit.Author != nil {
+		runevent.SHAAuthorName = commit.Author.GetName()
+		runevent.SHAAuthorEmail = commit.Author.GetEmail()
+		if commit.Author.Date != nil {
+			runevent.SHAAuthorDate = commit.Author.Date.Time
+		}
+	}
+	if commit.Committer != nil {
+		runevent.SHACommitterName = commit.Committer.GetName()
+		runevent.SHACommitterEmail = commit.Committer.GetEmail()
+		if commit.Committer.Date != nil {
+			runevent.SHACommitterDate = commit.Committer.Date.Time
+		}
+	}
 
 	return nil
 }
@@ -500,11 +520,24 @@ func (v *Provider) getPullRequest(ctx context.Context, runevent *info.Event) (*i
 	return runevent, nil
 }
 
-// GetFiles get a files from pull request.
+// GetFiles gets and caches the list of files changed by a given event.
 func (v *Provider) GetFiles(ctx context.Context, runevent *info.Event) (changedfiles.ChangedFiles, error) {
-	if runevent.TriggerTarget == triggertype.PullRequest {
+	if v.cachedChangedFiles == nil {
+		changes, err := v.fetchChangedFiles(ctx, runevent)
+		if err != nil {
+			return changedfiles.ChangedFiles{}, err
+		}
+		v.cachedChangedFiles = &changes
+	}
+	return *v.cachedChangedFiles, nil
+}
+
+func (v *Provider) fetchChangedFiles(ctx context.Context, runevent *info.Event) (changedfiles.ChangedFiles, error) {
+	changedFiles := changedfiles.ChangedFiles{}
+
+	switch runevent.TriggerTarget {
+	case triggertype.PullRequest:
 		opt := &github.ListOptions{PerPage: v.PaginedNumber}
-		changedFiles := changedfiles.ChangedFiles{}
 		for {
 			repoCommit, resp, err := wrapAPI(v, "list_pull_request_files", func() ([]*github.CommitFile, *github.Response, error) {
 				return v.Client().PullRequests.ListFiles(ctx, runevent.Organization, runevent.Repository, runevent.PullRequestNumber, opt)
@@ -532,11 +565,7 @@ func (v *Provider) GetFiles(ctx context.Context, runevent *info.Event) (changedf
 			}
 			opt.Page = resp.NextPage
 		}
-		return changedFiles, nil
-	}
-
-	if runevent.TriggerTarget == "push" {
-		changedFiles := changedfiles.ChangedFiles{}
+	case triggertype.Push:
 		rC, _, err := wrapAPI(v, "get_commit_files", func() (*github.RepositoryCommit, *github.Response, error) {
 			return v.Client().Repositories.GetCommit(ctx, runevent.Organization, runevent.Repository, runevent.SHA, &github.ListOptions{})
 		})
@@ -558,9 +587,10 @@ func (v *Provider) GetFiles(ctx context.Context, runevent *info.Event) (changedf
 				changedFiles.Renamed = append(changedFiles.Renamed, *rC.Files[i].Filename)
 			}
 		}
-		return changedFiles, nil
+	default:
+		// No action necessary
 	}
-	return changedfiles.ChangedFiles{}, nil
+	return changedFiles, nil
 }
 
 // getObject Get an object from a repository.
@@ -607,7 +637,17 @@ func ListRepos(ctx context.Context, v *Provider) ([]string, error) {
 }
 
 func (v *Provider) CreateToken(ctx context.Context, repository []string, event *info.Event) (string, error) {
+	var appReposCache []*github.Repository
+
 	for _, r := range repository {
+		// Check if this is a glob pattern
+		if strings.ContainsAny(r, "*?[") {
+			if err := v.expandGlobAndAddRepoIDs(ctx, r, &appReposCache); err != nil {
+				v.Logger.Warn("failed to expand glob pattern %q: %v", r, err)
+			}
+			continue
+		}
+
 		split := strings.Split(r, "/")
 		infoData, _, err := wrapAPI(v, "get_repository", func() (*github.Repository, *github.Response, error) {
 			return v.Client().Repositories.Get(ctx, split[0], split[1])
@@ -624,6 +664,52 @@ func (v *Provider) CreateToken(ctx context.Context, repository []string, event *
 		return "", err
 	}
 	return token, nil
+}
+
+func (v *Provider) expandGlobAndAddRepoIDs(ctx context.Context, repoPattern string, cache *[]*github.Repository) error {
+	// We can skip error check here as all the glob compilation has been checked
+	// before this method is called.
+	reposToScope, _ := glob.Compile(repoPattern)
+
+	if *cache == nil {
+		repos, err := v.listAppRepos(ctx)
+		if err != nil {
+			return err
+		}
+		*cache = repos
+	}
+
+	for _, repo := range *cache {
+		repoFullName := repo.GetFullName()
+		if reposToScope.Match(repoFullName) {
+			v.RepositoryIDs = uniqueRepositoryID(v.RepositoryIDs, repo.GetID())
+		}
+	}
+
+	return nil
+}
+
+func (v *Provider) listAppRepos(ctx context.Context) ([]*github.Repository, error) {
+	var allRepos []*github.Repository
+
+	opt := &github.ListOptions{PerPage: v.PaginedNumber}
+	for {
+		repoList, resp, err := wrapAPI(v, "list_app_repos", func() (*github.ListRepositories, *github.Response, error) {
+			return v.Client().Apps.ListRepos(ctx, opt)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list app repos: %w", err)
+		}
+
+		allRepos = append(allRepos, repoList.Repositories...)
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return allRepos, nil
 }
 
 func uniqueRepositoryID(repoIDs []int64, id int64) []int64 {

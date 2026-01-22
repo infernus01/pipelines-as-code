@@ -1,5 +1,4 @@
 //go:build e2e
-// +build e2e
 
 package test
 
@@ -9,7 +8,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/google/go-github/v71/github"
+	"github.com/google/go-github/v81/github"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/keys"
 	"github.com/openshift-pipelines/pipelines-as-code/test/pkg/cctx"
 	tgithub "github.com/openshift-pipelines/pipelines-as-code/test/pkg/github"
@@ -34,7 +33,9 @@ func TestGithubPushRequestGitOpsCommentOnComment(t *testing.T) {
 	defer g.TearDown(ctx, t)
 
 	// let's make sure we didn't create any PipelineRuns since we only match on-comment here
-	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), 0)
 
@@ -61,7 +62,9 @@ func TestGithubPushRequestGitOpsCommentOnComment(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, repo.Status[len(repo.Status)-1].Conditions[0].Status, corev1.ConditionTrue)
 
-	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), len(g.YamlFiles))
 	lastPrName := pruns.Items[0].GetName()
@@ -90,7 +93,9 @@ func TestGithubPushRequestGitOpsCommentRetest(t *testing.T) {
 	defer g.TearDown(ctx, t)
 	comment := "/retest branch:" + g.TargetNamespace
 
-	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), 2)
 
@@ -117,7 +122,9 @@ func TestGithubPushRequestGitOpsCommentRetest(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, repo.Status[len(repo.Status)-1].Conditions[0].Status, corev1.ConditionTrue)
 
-	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), 4)
 
@@ -143,7 +150,9 @@ func TestGithubPushRequestGitOpsCommentCancel(t *testing.T) {
 	ctx, err := cctx.GetControllerCtxInfo(ctx, g.Cnx)
 	assert.NilError(t, err)
 
-	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err := g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), 2)
 
@@ -172,8 +181,8 @@ func TestGithubPushRequestGitOpsCommentCancel(t *testing.T) {
 		&github.RepositoryComment{Body: github.Ptr(comment)})
 	assert.NilError(t, err)
 
-	g.Cnx.Clients.Log.Infof("Waiting for Repository to be updated still to %d since it has been canceled", numberOfStatus)
-	repo, _ := twait.UntilRepositoryUpdated(ctx, g.Cnx.Clients, waitOpts) // don't check for error, because canceled is not success and this will fail
+	g.Cnx.Clients.Log.Infof("Waiting for Repository to be updated still to %d since it has been cancelled", numberOfStatus)
+	repo, _ := twait.UntilRepositoryUpdated(ctx, g.Cnx.Clients, waitOpts) // don't check for error, because cancelled is not success and this will fail
 	cancelled := false
 	for _, c := range repo.Status {
 		if c.Conditions[0].Reason == tektonv1.TaskRunReasonCancelled.String() {
@@ -193,7 +202,9 @@ func TestGithubPushRequestGitOpsCommentCancel(t *testing.T) {
 	}
 
 	// make sure the number of items
-	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{})
+	pruns, err = g.Cnx.Clients.Tekton.TektonV1().PipelineRuns(g.TargetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", keys.SHA, g.SHA),
+	})
 	assert.NilError(t, err)
 	assert.Equal(t, len(pruns.Items), numberOfStatus)
 	cancelled = false

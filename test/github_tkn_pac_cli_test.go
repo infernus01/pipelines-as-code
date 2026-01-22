@@ -1,5 +1,4 @@
 //go:build e2e
-// +build e2e
 
 package test
 
@@ -48,7 +47,7 @@ spec:
         taskSpec:
           steps:
             - name: task
-              image: registry.access.redhat.com/ubi9/ubi-micro
+              image: registry.access.redhat.com/ubi10/ubi-micro
               command: ["/bin/echo", "HELLOMOTO"]
 `, targetNS, options.MainBranch, triggertype.PullRequest.String()),
 	}

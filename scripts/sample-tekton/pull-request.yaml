@@ -1,0 +1,50 @@
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pac-test-pipeline
+  annotations:
+    # Trigger on pull/merge requests targeting main branch
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    # Keep only last 2 pipeline runs
+    pipelinesascode.tekton.dev/max-keep-runs: "2"
+spec:
+  pipelineSpec:
+    tasks:
+      - name: echo-hello
+        taskSpec:
+          steps:
+            - name: echo
+              image: registry.access.redhat.com/ubi9/ubi-micro
+              command:
+                - /bin/echo
+              args:
+                - "Hello from PAC! Pipeline triggered successfully."
+      - name: show-context
+        runAfter:
+          - echo-hello
+        taskSpec:
+          steps:
+            - name: show-info
+              image: registry.access.redhat.com/ubi9/ubi-micro
+              env:
+                - name: REPO_URL
+                  value: "{{ repo_url }}"
+                - name: REVISION
+                  value: "{{ revision }}"
+                - name: SOURCE_BRANCH
+                  value: "{{ source_branch }}"
+                - name: TARGET_BRANCH
+                  value: "{{ target_branch }}"
+              command:
+                - /bin/sh
+              args:
+                - -c
+                - |
+                  echo "=== Pipeline Context ==="
+                  echo "Repository: ${REPO_URL}"
+                  echo "Revision: ${REVISION}"
+                  echo "Source Branch: ${SOURCE_BRANCH}"
+                  echo "Target Branch: ${TARGET_BRANCH}"
+                  echo "========================"

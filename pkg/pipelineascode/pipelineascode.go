@@ -13,6 +13,7 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/formatting"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/kubeinteraction"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/matcher"
+	"github.com/openshift-pipelines/pipelines-as-code/pkg/opscomments"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/info"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/settings"
@@ -21,6 +22,7 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/secrets"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -29,6 +31,7 @@ const (
 	CompletedStatus   = "completed"
 	inProgressStatus  = "in_progress"
 	queuedStatus      = "queued"
+	successConclusion = "success"
 	failureConclusion = "failure"
 	pendingConclusion = "pending"
 	neutralConclusion = "neutral"
@@ -55,13 +58,21 @@ func NewPacs(event *info.Event, vcx provider.Interface, run *params.Run, pacInfo
 }
 
 func (p *PacRun) Run(ctx context.Context) error {
-	matchedPRs, repo, err := p.matchRepoPR(ctx)
-	if repo != nil && p.event.TriggerTarget == triggertype.PullRequestClosed {
-		if err := p.cancelAllInProgressBelongingToClosedPullRequest(ctx, repo); err != nil {
-			return fmt.Errorf("error cancelling in progress pipelineRuns belonging to pull request %d: %w", p.event.PullRequestNumber, err)
+	// For PullRequestClosed events, skip matching logic and go straight to cancellation
+	if p.event.TriggerTarget == triggertype.PullRequestClosed {
+		repo, err := p.verifyRepoAndUser(ctx)
+		if err != nil {
+			return err
+		}
+		if repo != nil {
+			if err := p.cancelAllInProgressBelongingToClosedPullRequest(ctx, repo); err != nil {
+				return fmt.Errorf("error cancelling in progress pipelineRuns belonging to pull request %d: %w", p.event.PullRequestNumber, err)
+			}
 		}
 		return nil
 	}
+
+	matchedPRs, repo, err := p.matchRepoPR(ctx)
 	if err != nil {
 		createStatusErr := p.vcx.CreateStatus(ctx, p.event, provider.StatusOpts{
 			Status:     CompletedStatus,
@@ -79,6 +90,15 @@ func (p *PacRun) Run(ctx context.Context) error {
 	}
 	if repo.Spec.ConcurrencyLimit != nil && *repo.Spec.ConcurrencyLimit != 0 {
 		p.manager.Enable()
+	}
+
+	// Defensive skip-CI check: this is a safety net in case events bypass the early check in sinker.
+	// Primary skip detection happens in sinker.processEvent() for performance, but this ensures
+	// nothing slips through (e.g., tests that call Run() directly, or edge cases).
+	// Skip only for non-GitOps events (GitOps commands can override skip-CI).
+	if p.event.HasSkipCommand && !opscomments.IsAnyOpsEventType(p.event.EventType) {
+		p.logger.Infof("CI skipped: commit contains skip command in message (secondary check)")
+		return nil
 	}
 
 	// set params for the console driver, only used for the custom console ones
@@ -112,6 +132,9 @@ func (p *PacRun) Run(ctx context.Context) error {
 				errMsgM := fmt.Sprintf("There was an error creating the PipelineRun: <b>%s</b>\n\n%s", match.PipelineRun.GetGenerateName(), err.Error())
 				p.eventEmitter.EmitMessage(repo, zap.ErrorLevel, "RepositoryPipelineRun", errMsg)
 				createStatusErr := p.vcx.CreateStatus(ctx, p.event, provider.StatusOpts{
+					PipelineRunName:          match.PipelineRun.GetName(),
+					PipelineRun:              match.PipelineRun,
+					OriginalPipelineRunName:  match.PipelineRun.GetAnnotations()[keys.OriginalPRName],
 					Status:                   CompletedStatus,
 					Conclusion:               failureConclusion,
 					Text:                     errMsgM,
@@ -166,7 +189,17 @@ func (p *PacRun) startPR(ctx context.Context, match matcher.Match) (*tektonv1.Pi
 		}
 
 		if err = p.k8int.CreateSecret(ctx, match.Repo.GetNamespace(), authSecret); err != nil {
-			return nil, fmt.Errorf("creating basic auth secret: %s has failed: %w ", authSecret.GetName(), err)
+			// NOTE: Handle AlreadyExists errors due to etcd/API server timing issues.
+			// Investigation found: slow etcd response causes API server retry, resulting in
+			// duplicate secret creation attempts for the same PR. This is a workaround, not
+			// designed behavior - reuse existing secret to prevent PipelineRun failure.
+			if errors.IsAlreadyExists(err) {
+				msg := fmt.Sprintf("Secret %s already exists in namespace %s, reusing existing secret",
+					authSecret.GetName(), match.Repo.GetNamespace())
+				p.eventEmitter.EmitMessage(match.Repo, zap.WarnLevel, "RepositorySecretReused", msg)
+			} else {
+				return nil, fmt.Errorf("creating basic auth secret: %s has failed: %w ", authSecret.GetName(), err)
+			}
 		}
 	}
 
@@ -278,9 +311,11 @@ func (p *PacRun) startPR(ctx context.Context, match matcher.Match) (*tektonv1.Pi
 	if len(patchAnnotations) > 0 || len(patchLabels) > 0 {
 		pr, err = action.PatchPipelineRun(ctx, p.logger, whatPatching, p.run.Clients.Tekton, pr, getMergePatch(patchAnnotations, patchLabels))
 		if err != nil {
-			// we still return the created PR with error, and allow caller to decide what to do with the PR, and avoid
-			// unneeded SIGSEGV's
-			return pr, fmt.Errorf("cannot patch pipelinerun %s: %w", pr.GetGenerateName(), err)
+			// if PipelineRun patch is failed then do not return error, just log the error
+			// because its a false negative and on startPR return a failed check is being created
+			// due to this.
+			p.logger.Errorf("cannot patch pipelinerun %s: %w", pr.GetGenerateName(), err)
+			return pr, nil
 		}
 		currentReason := ""
 		if len(pr.Status.GetConditions()) > 0 {

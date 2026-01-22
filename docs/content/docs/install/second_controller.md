@@ -23,16 +23,65 @@ Each GitHub application requires:
 
 ## Controller Configuration Parameters
 
-| Environment Variable       | Description                                      | Example          |
-|----------------------------|--------------------------------------------------|------------------|
-| `PAC_CONTROLLER_LABEL`     | Unique identifier for the controller instance    | `github-enterprise` |
-| `PAC_CONTROLLER_SECRET`    | Secret containing GitHub App credentials         | `gh-enterprise-secret` |
-| `PAC_CONTROLLER_CONFIGMAP` | ConfigMap with application settings              | `gh-enterprise-config` |
+| Environment Variable         | Description                                        | Example                |
+| ---------------------------- | -------------------------------------------------- | ---------------------- |
+| `PAC_CONTROLLER_LABEL`       | Unique identifier for the controller instance      | `github-enterprise`    |
+| `PAC_CONTROLLER_SECRET`      | Secret containing GitHub App credentials           | `gh-enterprise-secret` |
+| `PAC_CONTROLLER_CONFIGMAP`   | ConfigMap with application settings                | `gh-enterprise-config` |
 
 {{< hint info >}}
 **Note:** While each GitHub application requires its own controller, only one
 status reconciler ("watcher") component is needed cluster-wide.
 {{< /hint >}}
+
+## Automated CI Setup with startpaac
+
+For automated testing environments, [startpaac](https://github.com/openshift-pipelines/startpaac) can automatically install and configure second controllers.
+
+### Prerequisites
+
+- startpaac installed and configured
+- Secret files for the second GitHub application
+
+### Automatic Installation in CI Mode
+
+When running startpaac with the `--ci` flag, it automatically detects and installs the second controller if:
+
+1. `PAC_SECOND_SECRET_FOLDER` environment variable is set
+2. Required secret files exist in that folder:
+   - `github-application-id`
+   - `github-private-key`
+   - `webhook.secret`
+   - `smee` (optional, for webhook tunneling)
+
+Example:
+
+```bash
+# Create secret folder with GitHub App credentials
+mkdir -p ~/secrets-second
+echo "12345" > ~/secrets-second/github-application-id
+echo "...RSA PRIVATE KEY..." > ~/secrets-second/github-private-key
+echo "webhook-secret-value" > ~/secrets-second/webhook.secret
+echo "https://smee.io/your-channel" > ~/secrets-second/smee
+
+# Export environment variable
+export PAC_SECOND_SECRET_FOLDER=~/secrets-second
+
+# Run startpaac in CI mode
+cd startpaac
+./startpaac --ci -a
+```
+
+This will:
+
+- Generate TLS certificates using minica for the second controller domain
+- Create Kubernetes secrets from the secret folder
+- Deploy the second controller with proper ingress/route configuration
+- Configure gosmee for webhook tunneling (if smee URL provided)
+
+### Manual Setup
+
+For manual installation or custom configurations, use the `second-controller.py` script as described below.
 
 ## Deployment Automation Script
 
@@ -61,15 +110,15 @@ Usage: second-controller.py [-h] [--configmap CONFIGMAP]
 
 #### Key Options
 
-| Option                   | Description                                                                 |
-|--------------------------|-----------------------------------------------------------------------------|
-| `--configmap`            | ConfigMap name (default: `<LABEL>-configmap`)                              |
-| `--secret`               | Secret name (default: `<LABEL>-secret`)                                    |
-| `--ingress-domain`       | Create Ingress with specified domain (Kubernetes)                          |
-| `--openshift-route`      | Create OpenShift Route instead of Ingress                                  |
-| `--controller-image`     | Custom controller image (use `ko` for local builds)                        |
-| `--smee-url`             | Deploy Gosmee sidecar for webhook tunneling                                |
-| `--namespace`            | Target namespace (default: `pipelines-as-code`)                            |
+| Option                     | Description                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `--configmap`              | ConfigMap name (default: `<LABEL>-configmap`)                                 |
+| `--secret`                 | Secret name (default: `<LABEL>-secret`)                                       |
+| `--ingress-domain`         | Create Ingress with specified domain (Kubernetes)                             |
+| `--openshift-route`        | Create OpenShift Route instead of Ingress                                     |
+| `--controller-image`       | Custom controller image (use `ko` for local builds)                           |
+| `--smee-url`               | Deploy Gosmee sidecar for webhook tunneling                                   |
+| `--namespace`              | Target namespace (default: `pipelines-as-code`)                               |
 
 ### Example Scenarios
 
